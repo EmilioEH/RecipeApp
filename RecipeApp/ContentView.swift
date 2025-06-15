@@ -497,6 +497,9 @@ struct ContentView: View {
     @State private var sortOption: SortOption = .recent
     @State private var showingShareSheet = false
     @State private var shareItems: [Any] = []
+    @State private var isInPlanningMode = false
+    @State private var selectedRecipeIDs: Set<UUID> = []
+    @State private var showingPlanningSheet = false
     
     enum SortOption: String, CaseIterable {
         case name = "Name"
@@ -512,6 +515,10 @@ struct ContentView: View {
             case .favorites: return "heart"
             }
         }
+    }
+    
+    var selectedRecipesCount: Int {
+        selectedRecipeIDs.count
     }
     
     var filteredRecipes: [Recipe] {
@@ -593,22 +600,49 @@ struct ContentView: View {
                         } else {
                             List {
                                 ForEach(filteredRecipes) { recipe in
-                                    NavigationLink(destination: RecipeDetailView(recipe: recipe, storageManager: storageManager)) {
-                                        RecipeRowView(recipe: recipe)
-                                    }
-                                    .contextMenu {
-                                        Button(action: { shareRecipe(recipe) }) {
-                                            Label("Share Recipe", systemImage: "square.and.arrow.up")
+                                    HStack {
+                                        if isInPlanningMode {
+                                            Button(action: {
+                                                withAnimation(.easeInOut(duration: 0.2)) {
+                                                    if selectedRecipeIDs.contains(recipe.id) {
+                                                        selectedRecipeIDs.remove(recipe.id)
+                                                    } else {
+                                                        selectedRecipeIDs.insert(recipe.id)
+                                                    }
+                                                }
+                                                let impactFeedback = UIImpactFeedbackGenerator(style: .light)
+                                                impactFeedback.impactOccurred()
+                                            }) {
+                                                Image(systemName: selectedRecipeIDs.contains(recipe.id) ? "checkmark.circle.fill" : "circle")
+                                                    .font(.title2)
+                                                    .foregroundColor(selectedRecipeIDs.contains(recipe.id) ? .blue : .gray)
+                                            }
+                                            .buttonStyle(PlainButtonStyle())
                                         }
                                         
-                                        Button(action: {
-                                            UIPasteboard.general.string = recipe.shareableText
-                                        }) {
-                                            Label("Copy to Clipboard", systemImage: "doc.on.doc")
+                                        NavigationLink(destination: RecipeDetailView(recipe: recipe, storageManager: storageManager)) {
+                                            RecipeRowView(recipe: recipe)
+                                        }
+                                        .disabled(isInPlanningMode)
+                                    }
+                                    .listRowBackground(
+                                        selectedRecipeIDs.contains(recipe.id) ? Color.blue.opacity(0.1) : Color.clear
+                                    )
+                                    .contextMenu {
+                                        if !isInPlanningMode {
+                                            Button(action: { shareRecipe(recipe) }) {
+                                                Label("Share Recipe", systemImage: "square.and.arrow.up")
+                                            }
+                                            
+                                            Button(action: {
+                                                UIPasteboard.general.string = recipe.shareableText
+                                            }) {
+                                                Label("Copy to Clipboard", systemImage: "doc.on.doc")
+                                            }
                                         }
                                     }
                                 }
-                                .onDelete(perform: deleteRecipes)
+                                .onDelete(perform: isInPlanningMode ? nil : deleteRecipes)
                             }
                         }
                     }
@@ -622,6 +656,15 @@ struct ContentView: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     if storageManager.storageURL != nil {
                         Menu {
+                            Button(action: {
+                                withAnimation {
+                                    isInPlanningMode = true
+                                    selectedRecipeIDs.removeAll()
+                                }
+                            }) {
+                                Label("Plan Weekly Meals", systemImage: "calendar")
+                            }
+                            
                             Button(action: { storageManager.loadRecipes() }) {
                                 Label("Refresh", systemImage: "arrow.clockwise")
                             }
@@ -650,17 +693,72 @@ struct ContentView: View {
                         } label: {
                             Image(systemName: "ellipsis.circle")
                         }
+                        .disabled(isInPlanningMode)
                     }
                 }
                 
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if storageManager.storageURL != nil {
-                        Button(action: { showingAddRecipe = true }) {
-                            Image(systemName: "plus")
+                        HStack {
+                            if !isInPlanningMode {
+                                Button(action: { showingAddRecipe = true }) {
+                                    Image(systemName: "plus")
+                                }
+                            } else {
+                                Button("Cancel") {
+                                    withAnimation {
+                                        isInPlanningMode = false
+                                        selectedRecipeIDs.removeAll()
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
+            .overlay(
+                Group {
+                    if isInPlanningMode && selectedRecipeIDs.count > 0 {
+                        VStack {
+                            Spacer()
+                            
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("\(selectedRecipesCount) recipe\(selectedRecipesCount == 1 ? "" : "s") selected")
+                                        .font(.headline)
+                                    Text("for weekly planning")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                
+                                Spacer()
+                                
+                                Button(action: {
+                                    showingPlanningSheet = true
+                                }) {
+                                    Label("Plan Week", systemImage: "calendar.badge.plus")
+                                        .font(.headline)
+                                        .foregroundColor(.white)
+                                        .padding(.horizontal, 20)
+                                        .padding(.vertical, 10)
+                                        .background(Color.blue)
+                                        .cornerRadius(25)
+                                }
+                            }
+                            .padding()
+                            .background(
+                                RoundedRectangle(cornerRadius: 16)
+                                    .fill(Color(.systemBackground))
+                                    .shadow(radius: 10)
+                            )
+                            .padding()
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
+                }
+                .animation(.spring(), value: isInPlanningMode)
+                .animation(.spring(), value: selectedRecipeIDs.count)
+            )
             .sheet(isPresented: $showingAddRecipe) {
                 AddRecipeView(storageManager: storageManager)
             }
@@ -669,6 +767,16 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showingShareSheet) {
                 ShareSheet(items: shareItems)
+            }
+            .sheet(isPresented: $showingPlanningSheet) {
+                WeeklyPlanningView(
+                    selectedRecipeIDs: selectedRecipeIDs,
+                    recipes: storageManager.recipes,
+                    onComplete: {
+                        isInPlanningMode = false
+                        selectedRecipeIDs.removeAll()
+                    }
+                )
             }
         }
     }
@@ -966,7 +1074,7 @@ struct RecipeDetailView: View {
                         }
                         
                         Button(action: shareRecipeFile) {
-                            Label("Share Recipe File", systemImage: "doc")
+                            Label("Share JSON File", systemImage: "doc")
                         }
                         
                         Button(action: printRecipe) {
@@ -1321,6 +1429,98 @@ struct EditRecipeView: View {
                         dismiss()
                     }
                     .disabled(name.isEmpty || ingredients.isEmpty || instructions.isEmpty)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Weekly Planning View
+struct WeeklyPlanningView: View {
+    let selectedRecipeIDs: Set<UUID>
+    let recipes: [Recipe]
+    let onComplete: () -> Void
+    
+    @Environment(\.dismiss) var dismiss
+    
+    var selectedRecipes: [Recipe] {
+        recipes.filter { selectedRecipeIDs.contains($0.id) }
+    }
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                // Summary header
+                VStack(spacing: 8) {
+                    Text("\(selectedRecipes.count) Recipes Selected")
+                        .font(.headline)
+                    
+                    Text("Ready to generate your weekly shopping list")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .padding()
+                .frame(maxWidth: .infinity)
+                .background(Color(.systemGray6))
+                
+                // Selected recipes list
+                List {
+                    ForEach(selectedRecipes) { recipe in
+                        HStack {
+                            Image(systemName: recipe.category.icon)
+                                .foregroundColor(.blue)
+                                .frame(width: 30)
+                            
+                            VStack(alignment: .leading) {
+                                Text(recipe.name)
+                                    .font(.headline)
+                                Text("\(recipe.servings) servings")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            
+                            Spacer()
+                            
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+                
+                // Action buttons
+                VStack(spacing: 12) {
+                    Button(action: {
+                        // TODO: Generate shopping list
+                        dismiss()
+                        onComplete()
+                    }) {
+                        Label("Generate Shopping List", systemImage: "cart.fill")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(Color.blue)
+                            .cornerRadius(10)
+                    }
+                    
+                    Button(action: {
+                        dismiss()
+                    }) {
+                        Text("Back to Selection")
+                            .foregroundColor(.blue)
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle("Weekly Planning")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Cancel") {
+                        dismiss()
+                        onComplete()
+                    }
                 }
             }
         }
