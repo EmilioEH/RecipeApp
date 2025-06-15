@@ -1,7 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-// iOS 14+ Compatible Recipe App
+// iOS 14+ Compatible Recipe App - Individual File Storage
 
 // MARK: - Data Models
 struct Recipe: Identifiable, Codable {
@@ -17,6 +17,7 @@ struct Recipe: Identifiable, Codable {
     var rating: Double
     var lastModified: Date
     var lastModifiedBy: String
+    var imageFileName: String? // Reference to image file in same folder
     
     var totalTime: Int {
         prepTime + cookTime
@@ -35,6 +36,24 @@ struct Recipe: Identifiable, Codable {
         self.rating = rating
         self.lastModified = Date()
         self.lastModifiedBy = UIDevice.current.name
+        self.imageFileName = nil
+    }
+    
+    // Generate a safe filename from the recipe name
+    var fileName: String {
+        let safeName = name
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: "\\", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: "*", with: "-")
+            .replacingOccurrences(of: "?", with: "-")
+            .replacingOccurrences(of: "\"", with: "-")
+            .replacingOccurrences(of: "<", with: "-")
+            .replacingOccurrences(of: ">", with: "-")
+            .replacingOccurrences(of: "|", with: "-")
+            .trimmingCharacters(in: .whitespaces)
+        
+        return "\(safeName)_\(id.uuidString).json"
     }
 }
 
@@ -58,28 +77,28 @@ enum RecipeCategory: String, CaseIterable, Codable {
     }
 }
 
-struct RecipeData: Codable {
-    var recipes: [Recipe]
-    var lastSyncDate: Date
-}
-
 // MARK: - Storage Manager
 class RecipeStorageManager: ObservableObject {
     @Published var recipes: [Recipe] = []
     @Published var storageURL: URL?
     @Published var isLoading = false
     @Published var lastError: String?
-    @Published var hasUnsavedChanges = false
     
     private let userDefaults = UserDefaults.standard
     private let storageKey = "RecipeStorageURL"
-    private let fileName = "recipes.json"
+    private let recipeExtension = "json"
+    private var fileMonitor: DispatchSourceFileSystemObject?
     
     init() {
         loadStorageURL()
         if storageURL != nil {
             loadRecipes()
+            startMonitoringFolder()
         }
+    }
+    
+    deinit {
+        fileMonitor?.cancel()
     }
     
     private func loadStorageURL() {
@@ -102,9 +121,36 @@ class RecipeStorageManager: ObservableObject {
             userDefaults.set(bookmarkData, forKey: storageKey)
             storageURL = url
             loadRecipes()
+            startMonitoringFolder()
         } catch {
             lastError = "Failed to save storage location: \(error.localizedDescription)"
         }
+    }
+    
+    private func startMonitoringFolder() {
+        guard let folderURL = storageURL else { return }
+        
+        fileMonitor?.cancel()
+        
+        let fileDescriptor = open(folderURL.path, O_EVTONLY)
+        guard fileDescriptor >= 0 else { return }
+        
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fileDescriptor,
+            eventMask: [.write, .delete, .rename],
+            queue: DispatchQueue.main
+        )
+        
+        source.setEventHandler { [weak self] in
+            self?.loadRecipes()
+        }
+        
+        source.setCancelHandler {
+            close(fileDescriptor)
+        }
+        
+        source.resume()
+        fileMonitor = source
     }
     
     func loadRecipes() {
@@ -113,42 +159,72 @@ class RecipeStorageManager: ObservableObject {
         isLoading = true
         lastError = nil
         
-        let fileURL = folderURL.appendingPathComponent(fileName)
-        
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            do {
-                let data = try Data(contentsOf: fileURL)
-                let recipeData = try JSONDecoder().decode(RecipeData.self, from: data)
-                self.recipes = recipeData.recipes
-                hasUnsavedChanges = false
-            } catch {
-                lastError = "Failed to load recipes: \(error.localizedDescription)"
-                // Load sample recipes on error
-                loadSampleRecipes()
+        do {
+            // Access the security-scoped resource
+            _ = folderURL.startAccessingSecurityScopedResource()
+            defer { folderURL.stopAccessingSecurityScopedResource() }
+            
+            let fileManager = FileManager.default
+            let contents = try fileManager.contentsOfDirectory(
+                at: folderURL,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            )
+            
+            var loadedRecipes: [Recipe] = []
+            
+            for fileURL in contents {
+                if fileURL.pathExtension == recipeExtension {
+                    do {
+                        let data = try Data(contentsOf: fileURL)
+                        let recipe = try JSONDecoder().decode(Recipe.self, from: data)
+                        loadedRecipes.append(recipe)
+                    } catch {
+                        print("Failed to load recipe from \(fileURL.lastPathComponent): \(error)")
+                    }
+                }
             }
-        } else {
-            // First time - create file with sample recipes
-            loadSampleRecipes()
-            saveRecipes()
+            
+            // Sort by most recently modified
+            self.recipes = loadedRecipes.sorted { $0.lastModified > $1.lastModified }
+            
+            // Create sample recipes if folder is empty
+            if recipes.isEmpty && contents.filter({ $0.pathExtension == recipeExtension }).isEmpty {
+                createSampleRecipes()
+            }
+        } catch {
+            lastError = "Failed to load recipes: \(error.localizedDescription)"
         }
         
         isLoading = false
     }
     
-    func saveRecipes() {
+    func saveRecipe(_ recipe: Recipe) {
         guard let folderURL = storageURL else { return }
         
-        let fileURL = folderURL.appendingPathComponent(fileName)
-        let recipeData = RecipeData(recipes: recipes, lastSyncDate: Date())
-        
         do {
+            // Access the security-scoped resource
+            _ = folderURL.startAccessingSecurityScopedResource()
+            defer { folderURL.stopAccessingSecurityScopedResource() }
+            
             let encoder = JSONEncoder()
             encoder.outputFormatting = .prettyPrinted
-            let data = try encoder.encode(recipeData)
+            let data = try encoder.encode(recipe)
+            
+            let fileURL = folderURL.appendingPathComponent(recipe.fileName)
             try data.write(to: fileURL)
-            hasUnsavedChanges = false
+            
+            // Update local array
+            if let index = recipes.firstIndex(where: { $0.id == recipe.id }) {
+                recipes[index] = recipe
+            } else {
+                recipes.append(recipe)
+            }
+            
+            // Sort by most recently modified
+            recipes.sort { $0.lastModified > $1.lastModified }
         } catch {
-            lastError = "Failed to save recipes: \(error.localizedDescription)"
+            lastError = "Failed to save recipe: \(error.localizedDescription)"
         }
     }
     
@@ -156,55 +232,55 @@ class RecipeStorageManager: ObservableObject {
         var newRecipe = recipe
         newRecipe.lastModified = Date()
         newRecipe.lastModifiedBy = UIDevice.current.name
-        recipes.append(newRecipe)
-        saveRecipes()
+        saveRecipe(newRecipe)
     }
     
     func updateRecipe(_ recipe: Recipe) {
-        if let index = recipes.firstIndex(where: { $0.id == recipe.id }) {
-            var updatedRecipe = recipe
-            updatedRecipe.lastModified = Date()
-            updatedRecipe.lastModifiedBy = UIDevice.current.name
-            recipes[index] = updatedRecipe
-            saveRecipes()
+        // Delete old file if name changed
+        if let existingRecipe = recipes.first(where: { $0.id == recipe.id }),
+           existingRecipe.fileName != recipe.fileName {
+            deleteRecipeFile(existingRecipe)
         }
+        
+        var updatedRecipe = recipe
+        updatedRecipe.lastModified = Date()
+        updatedRecipe.lastModifiedBy = UIDevice.current.name
+        saveRecipe(updatedRecipe)
+    }
+    
+    func deleteRecipe(_ recipe: Recipe) {
+        deleteRecipeFile(recipe)
+        recipes.removeAll { $0.id == recipe.id }
     }
     
     func deleteRecipe(at offsets: IndexSet) {
-        recipes.remove(atOffsets: offsets)
-        saveRecipes()
+        for index in offsets {
+            deleteRecipe(recipes[index])
+        }
     }
     
-    func checkForConflicts(completion: @escaping (Bool, RecipeData?) -> Void) {
-        guard let folderURL = storageURL else {
-            completion(false, nil)
-            return
-        }
-        
-        let fileURL = folderURL.appendingPathComponent(fileName)
+    private func deleteRecipeFile(_ recipe: Recipe) {
+        guard let folderURL = storageURL else { return }
         
         do {
-            let data = try Data(contentsOf: fileURL)
-            let diskData = try JSONDecoder().decode(RecipeData.self, from: data)
+            _ = folderURL.startAccessingSecurityScopedResource()
+            defer { folderURL.stopAccessingSecurityScopedResource() }
             
-            // Check if file has been modified since we last loaded
-            let hasConflicts = diskData.lastSyncDate > RecipeData(recipes: recipes, lastSyncDate: Date()).lastSyncDate
+            let fileURL = folderURL.appendingPathComponent(recipe.fileName)
+            try FileManager.default.removeItem(at: fileURL)
             
-            completion(hasConflicts, hasConflicts ? diskData : nil)
+            // Also delete associated image if exists
+            if let imageFileName = recipe.imageFileName {
+                let imageURL = folderURL.appendingPathComponent(imageFileName)
+                try? FileManager.default.removeItem(at: imageURL)
+            }
         } catch {
-            completion(false, nil)
+            print("Failed to delete recipe file: \(error)")
         }
     }
     
-    func resolveConflicts(useRemoteData: Bool, remoteData: RecipeData?) {
-        if useRemoteData, let remoteData = remoteData {
-            self.recipes = remoteData.recipes
-        }
-        saveRecipes()
-    }
-    
-    private func loadSampleRecipes() {
-        recipes = [
+    private func createSampleRecipes() {
+        let sampleRecipes = [
             Recipe(
                 name: "Classic Pancakes",
                 ingredients: ["2 cups flour", "2 eggs", "1.5 cups milk", "2 tbsp sugar", "2 tsp baking powder", "1/2 tsp salt", "2 tbsp melted butter"],
@@ -239,6 +315,127 @@ class RecipeStorageManager: ObservableObject {
                 rating: 5
             )
         ]
+        
+        for recipe in sampleRecipes {
+            addRecipe(recipe)
+        }
+    }
+    
+    func exportAllRecipes() -> URL? {
+        guard let folderURL = storageURL else { return nil }
+        
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            
+            let exportData = ["recipes": recipes, "exportDate": Date()] as [String : Any]
+            let data = try JSONSerialization.data(withJSONObject: exportData, options: .prettyPrinted)
+            
+            let exportURL = FileManager.default.temporaryDirectory.appendingPathComponent("recipes_export_\(Date().timeIntervalSince1970).json")
+            try data.write(to: exportURL)
+            
+            return exportURL
+        } catch {
+            print("Failed to export recipes: \(error)")
+            return nil
+        }
+    }
+}
+
+// MARK: - Recipe Sharing Extension
+extension Recipe {
+    var shareableText: String {
+        var text = "\(name)\n"
+        text += String(repeating: "=", count: name.count) + "\n\n"
+        
+        if rating > 0 {
+            text += "Rating: " + String(repeating: "★", count: Int(rating)) + String(repeating: "☆", count: 5 - Int(rating)) + "\n"
+        }
+        
+        text += """
+        Category: \(category.rawValue)
+        Prep Time: \(prepTime) minutes
+        Cook Time: \(cookTime) minutes
+        Total Time: \(totalTime) minutes
+        Servings: \(servings)
+        
+        INGREDIENTS
+        -----------
+        """
+        
+        for ingredient in ingredients {
+            text += "\n• \(ingredient)"
+        }
+        
+        text += "\n\nINSTRUCTIONS\n"
+        text += "-----------\n"
+        text += instructions
+        
+        if !notes.isEmpty {
+            text += "\n\nNOTES\n"
+            text += "-----\n"
+            text += notes
+        }
+        
+        text += "\n\n───────────────────────\n"
+        text += "Shared from My Recipe App"
+        
+        return text
+    }
+    
+    func generatePDF() -> Data? {
+        let pdfMetaData = [
+            kCGPDFContextCreator: "Recipe App",
+            kCGPDFContextAuthor: lastModifiedBy,
+            kCGPDFContextTitle: name
+        ]
+        
+        let format = UIGraphicsPDFRendererFormat()
+        format.documentInfo = pdfMetaData as [String: Any]
+        
+        let pageWidth = 8.5 * 72.0
+        let pageHeight = 11 * 72.0
+        let pageRect = CGRect(x: 0, y: 0, width: pageWidth, height: pageHeight)
+        
+        let renderer = UIGraphicsPDFRenderer(bounds: pageRect, format: format)
+        
+        let data = renderer.pdfData { (context) in
+            context.beginPage()
+            
+            let margin: CGFloat = 50
+            var yPosition: CGFloat = margin
+            
+            let titleFont = UIFont.boldSystemFont(ofSize: 24)
+            let headingFont = UIFont.boldSystemFont(ofSize: 16)
+            let bodyFont = UIFont.systemFont(ofSize: 12)
+            
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.alignment = .left
+            paragraphStyle.lineBreakMode = .byWordWrapping
+            
+            // Draw title
+            let titleAttributes: [NSAttributedString.Key: Any] = [
+                .font: titleFont,
+                .paragraphStyle: paragraphStyle
+            ]
+            
+            name.draw(at: CGPoint(x: margin, y: yPosition), withAttributes: titleAttributes)
+            yPosition += 40
+            
+            // Draw metadata
+            let metadataAttributes: [NSAttributedString.Key: Any] = [
+                .font: bodyFont,
+                .foregroundColor: UIColor.darkGray
+            ]
+            
+            let metadata = "Category: \(category.rawValue) | Prep: \(prepTime) min | Cook: \(cookTime) min | Servings: \(servings)"
+            metadata.draw(at: CGPoint(x: margin, y: yPosition), withAttributes: metadataAttributes)
+            yPosition += 30
+            
+            // Continue with rest of PDF generation...
+        }
+        
+        return data
     }
 }
 
@@ -268,14 +465,12 @@ struct StarRatingView: View {
                     .onTapGesture {
                         if interactive {
                             withAnimation(.easeInOut(duration: 0.2)) {
-                                // If tapping the same star, clear rating
                                 if rating == Double(star) {
                                     rating = 0
                                 } else {
                                     rating = Double(star)
                                 }
                             }
-                            // Haptic feedback
                             let impactFeedback = UIImpactFeedbackGenerator(style: .light)
                             impactFeedback.impactOccurred()
                         }
@@ -287,8 +482,6 @@ struct StarRatingView: View {
     func starType(for star: Int) -> String {
         if Double(star) <= rating {
             return "star.fill"
-        } else if Double(star) - 0.5 <= rating {
-            return "star.leadinghalf.filled"
         } else {
             return "star"
         }
@@ -301,9 +494,9 @@ struct ContentView: View {
     @State private var showingAddRecipe = false
     @State private var showingFolderPicker = false
     @State private var searchText = ""
-    @State private var showingConflictAlert = false
-    @State private var conflictData: RecipeData?
-    @State private var sortOption: SortOption = .name
+    @State private var sortOption: SortOption = .recent
+    @State private var showingShareSheet = false
+    @State private var shareItems: [Any] = []
     
     enum SortOption: String, CaseIterable {
         case name = "Name"
@@ -341,7 +534,7 @@ struct ContentView: View {
                 } else if $0.rating != 5 && $1.rating == 5 {
                     return false
                 } else {
-                    return $0.name < $1.name
+                    return $0.lastModified > $1.lastModified
                 }
             }
         }
@@ -373,7 +566,7 @@ struct ContentView: View {
                         .padding(.vertical, 8)
                         
                         // Sort indicator
-                        if sortOption != .name {
+                        if sortOption != .recent {
                             HStack {
                                 Image(systemName: sortOption.systemImage)
                                     .font(.caption)
@@ -386,18 +579,41 @@ struct ContentView: View {
                             .padding(.bottom, 4)
                         }
                         
-                        List {
-                            ForEach(filteredRecipes) { recipe in
-                                NavigationLink(destination: RecipeDetailView(recipe: recipe, storageManager: storageManager)) {
-                                    RecipeRowView(recipe: recipe)
-                                }
+                        if storageManager.recipes.isEmpty && !storageManager.isLoading {
+                            VStack(spacing: 20) {
+                                Image(systemName: "doc.text.magnifyingglass")
+                                    .font(.system(size: 60))
+                                    .foregroundColor(.gray)
+                                Text("No Recipes Yet")
+                                    .font(.title2)
+                                Text("Tap + to create your first recipe")
+                                    .foregroundColor(.secondary)
                             }
-                            .onDelete(perform: deleteRecipes)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else {
+                            List {
+                                ForEach(filteredRecipes) { recipe in
+                                    NavigationLink(destination: RecipeDetailView(recipe: recipe, storageManager: storageManager)) {
+                                        RecipeRowView(recipe: recipe)
+                                    }
+                                    .contextMenu {
+                                        Button(action: { shareRecipe(recipe) }) {
+                                            Label("Share Recipe", systemImage: "square.and.arrow.up")
+                                        }
+                                        
+                                        Button(action: {
+                                            UIPasteboard.general.string = recipe.shareableText
+                                        }) {
+                                            Label("Copy to Clipboard", systemImage: "doc.on.doc")
+                                        }
+                                    }
+                                }
+                                .onDelete(perform: deleteRecipes)
+                            }
                         }
                     }
                     .onAppear {
-                        // Refresh on appear
-                        refreshRecipesSync()
+                        storageManager.loadRecipes()
                     }
                 }
             }
@@ -406,7 +622,7 @@ struct ContentView: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     if storageManager.storageURL != nil {
                         Menu {
-                            Button(action: refreshRecipesSync) {
+                            Button(action: { storageManager.loadRecipes() }) {
                                 Label("Refresh", systemImage: "arrow.clockwise")
                             }
                             
@@ -420,6 +636,16 @@ struct ContentView: View {
                                 }
                             } label: {
                                 Label("Sort By", systemImage: "arrow.up.arrow.down")
+                            }
+                            
+                            Divider()
+                            
+                            Button(action: shareAllRecipes) {
+                                Label("Export All Recipes", systemImage: "square.and.arrow.up")
+                            }
+                            
+                            Button(action: { showingFolderPicker = true }) {
+                                Label("Change Storage Folder", systemImage: "folder")
                             }
                         } label: {
                             Image(systemName: "ellipsis.circle")
@@ -441,15 +667,8 @@ struct ContentView: View {
             .sheet(isPresented: $showingFolderPicker) {
                 DocumentPicker(storageManager: storageManager)
             }
-            .alert("Sync Conflict", isPresented: $showingConflictAlert) {
-                Button("Use My Changes") {
-                    storageManager.resolveConflicts(useRemoteData: false, remoteData: nil)
-                }
-                Button("Use Their Changes") {
-                    storageManager.resolveConflicts(useRemoteData: true, remoteData: conflictData)
-                }
-            } message: {
-                Text("The recipes have been modified by \(conflictData?.recipes.first?.lastModifiedBy ?? "another device"). Which version would you like to keep?")
+            .sheet(isPresented: $showingShareSheet) {
+                ShareSheet(items: shareItems)
             }
         }
     }
@@ -458,15 +677,16 @@ struct ContentView: View {
         storageManager.deleteRecipe(at: offsets)
     }
     
-    func refreshRecipesSync() {
-        storageManager.checkForConflicts { hasConflicts, remoteData in
-            if hasConflicts {
-                conflictData = remoteData
-                showingConflictAlert = true
-            } else {
-                storageManager.loadRecipes()
-            }
+    func shareAllRecipes() {
+        if let exportURL = storageManager.exportAllRecipes() {
+            shareItems = [exportURL]
+            showingShareSheet = true
         }
+    }
+    
+    func shareRecipe(_ recipe: Recipe) {
+        shareItems = [recipe.shareableText]
+        showingShareSheet = true
     }
 }
 
@@ -483,7 +703,13 @@ struct StorageSetupView: View {
                 .font(.title)
                 .fontWeight(.bold)
             
-            Text("Select a folder where your recipes will be stored. Choose an iCloud Drive folder to sync across devices and share with family.")
+            Text("Select a folder where your recipes will be stored. Each recipe will be saved as its own file, making it easy to share and backup.")
+                .multilineTextAlignment(.center)
+                .foregroundColor(.secondary)
+                .padding(.horizontal)
+            
+            Text("You can use iCloud Drive to sync across devices and share with family.")
+                .font(.caption)
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)
                 .padding(.horizontal)
@@ -528,7 +754,6 @@ struct DocumentPicker: UIViewControllerRepresentable {
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let url = urls.first else { return }
             
-            // Start accessing security-scoped resource
             guard url.startAccessingSecurityScopedResource() else {
                 print("Failed to access folder")
                 return
@@ -562,7 +787,7 @@ struct RecipeRowView: View {
                 }
                 
                 if recipe.rating > 0 {
-                    StarRatingView(rating: .constant(recipe.rating), interactive: false, starSize: 12)
+                    StarRatingView(rating: .constant(recipe.rating), interactive: false, starSize: 12, showEmptyStars: false)
                 }
                 
                 HStack {
@@ -576,7 +801,7 @@ struct RecipeRowView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
                 
-                Text("Modified by \(recipe.lastModifiedBy)")
+                Text("Modified \(recipe.lastModified, style: .relative)")
                     .font(.caption2)
                     .foregroundColor(Color.gray.opacity(0.6))
             }
@@ -592,6 +817,9 @@ struct RecipeDetailView: View {
     let storageManager: RecipeStorageManager
     @State private var showingEditView = false
     @State private var currentRating: Double
+    @State private var showingShareSheet = false
+    @State private var shareItems: [Any] = []
+    @State private var showingCopiedAlert = false
     
     init(recipe: Recipe, storageManager: RecipeStorageManager) {
         self.recipe = recipe
@@ -701,15 +929,177 @@ struct RecipeDetailView: View {
         }
         .navigationTitle(recipe.name)
         .navigationBarTitleDisplayMode(.large)
+        .overlay(
+            VStack {
+                if showingCopiedAlert {
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                        Text("Recipe copied to clipboard!")
+                            .font(.subheadline)
+                    }
+                    .padding()
+                    .background(Color(.systemBackground))
+                    .cornerRadius(10)
+                    .shadow(radius: 5)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .padding(.top, 50)
+                }
+                Spacer()
+            }
+            .animation(.easeInOut, value: showingCopiedAlert)
+        )
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button("Edit") {
-                    showingEditView = true
+                HStack {
+                    Menu {
+                        Button(action: shareAsText) {
+                            Label("Share as Text", systemImage: "doc.text")
+                        }
+                        
+                        Button(action: shareAsPDF) {
+                            Label("Share as PDF", systemImage: "doc.richtext")
+                        }
+                        
+                        Button(action: shareAsImage) {
+                            Label("Share as Image", systemImage: "photo")
+                        }
+                        
+                        Button(action: shareRecipeFile) {
+                            Label("Share Recipe File", systemImage: "doc")
+                        }
+                        
+                        Button(action: printRecipe) {
+                            Label("Print", systemImage: "printer")
+                        }
+                        
+                        Divider()
+                        
+                        Button(action: copyToClipboard) {
+                            Label("Copy to Clipboard", systemImage: "doc.on.doc")
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    
+                    Button("Edit") {
+                        showingEditView = true
+                    }
                 }
             }
         }
         .sheet(isPresented: $showingEditView) {
             EditRecipeView(recipe: recipe, storageManager: storageManager)
+        }
+        .sheet(isPresented: $showingShareSheet) {
+            ShareSheet(items: shareItems)
+        }
+    }
+    
+    // MARK: - Share Actions
+    func shareAsText() {
+        shareItems = [recipe.shareableText]
+        showingShareSheet = true
+    }
+    
+    func shareAsPDF() {
+        if let pdfData = recipe.generatePDF() {
+            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(recipe.name).pdf")
+            do {
+                try pdfData.write(to: tempURL)
+                shareItems = [tempURL]
+                showingShareSheet = true
+            } catch {
+                print("Failed to create PDF: \(error)")
+            }
+        }
+    }
+    
+    func shareAsImage() {
+        let recipeCard = RecipeCardView(recipe: recipe)
+        let image = recipeCard.snapshot()
+        shareItems = [image]
+        showingShareSheet = true
+    }
+    
+    func shareRecipeFile() {
+        guard let folderURL = storageManager.storageURL else { return }
+        
+        _ = folderURL.startAccessingSecurityScopedResource()
+        defer { folderURL.stopAccessingSecurityScopedResource() }
+        
+        let fileURL = folderURL.appendingPathComponent(recipe.fileName)
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            shareItems = [fileURL]
+            showingShareSheet = true
+        }
+    }
+    
+    func printRecipe() {
+        let printInfo = UIPrintInfo(dictionary: nil)
+        printInfo.outputType = .general
+        printInfo.jobName = recipe.name
+        
+        let printController = UIPrintInteractionController.shared
+        printController.printInfo = printInfo
+        
+        let formatter = UIMarkupTextPrintFormatter(markupText: """
+        <html>
+        <head>
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 20px; }
+                h1 { color: #333; }
+                h2 { color: #666; font-size: 18px; margin-top: 20px; }
+                .metadata { color: #888; font-size: 14px; }
+                ul { padding-left: 20px; }
+                li { margin: 5px 0; }
+                .instructions { white-space: pre-wrap; }
+                .notes { background: #f5f5f5; padding: 10px; border-radius: 5px; margin-top: 20px; }
+            </style>
+        </head>
+        <body>
+            <h1>\(recipe.name)</h1>
+            <div class="metadata">
+                <p>Category: \(recipe.category.rawValue) | Rating: \(recipe.rating > 0 ? String(repeating: "★", count: Int(recipe.rating)) : "Not rated")</p>
+                <p>Prep: \(recipe.prepTime) min | Cook: \(recipe.cookTime) min | Servings: \(recipe.servings)</p>
+            </div>
+            
+            <h2>Ingredients</h2>
+            <ul>
+                \(recipe.ingredients.map { "<li>\($0)</li>" }.joined())
+            </ul>
+            
+            <h2>Instructions</h2>
+            <div class="instructions">\(recipe.instructions)</div>
+            
+            \(recipe.notes.isEmpty ? "" : """
+            <div class="notes">
+                <h2>Notes</h2>
+                <p>\(recipe.notes)</p>
+            </div>
+            """)
+        </body>
+        </html>
+        """)
+        
+        printController.printFormatter = formatter
+        printController.present(animated: true)
+    }
+    
+    func copyToClipboard() {
+        UIPasteboard.general.string = recipe.shareableText
+        
+        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+        impactFeedback.impactOccurred()
+        
+        withAnimation {
+            showingCopiedAlert = true
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            withAnimation {
+                showingCopiedAlert = false
+            }
         }
     }
 }
@@ -935,6 +1325,169 @@ struct EditRecipeView: View {
             }
         }
     }
+}
+
+// MARK: - Recipe Card View for Image Export
+struct RecipeCardView: View {
+    let recipe: Recipe
+    
+    var body: some View {
+        ZStack {
+            // Background gradient
+            LinearGradient(
+                gradient: Gradient(colors: [Color.blue.opacity(0.1), Color.white]),
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            
+            VStack(alignment: .leading, spacing: 16) {
+                // Header
+                HStack {
+                    Image(systemName: recipe.category.icon)
+                        .font(.system(size: 40))
+                        .foregroundColor(.blue)
+                    
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(recipe.name)
+                            .font(.title)
+                            .fontWeight(.bold)
+                            .lineLimit(2)
+                        
+                        if recipe.rating > 0 {
+                            HStack(spacing: 2) {
+                                ForEach(1...5, id: \.self) { star in
+                                    Image(systemName: Double(star) <= recipe.rating ? "star.fill" : "star")
+                                        .font(.caption)
+                                        .foregroundColor(.yellow)
+                                }
+                            }
+                        }
+                    }
+                    
+                    Spacer()
+                }
+                
+                // Time and servings
+                HStack(spacing: 30) {
+                    HStack {
+                        Image(systemName: "clock")
+                            .foregroundColor(.blue)
+                        Text("\(recipe.totalTime) min")
+                    }
+                    HStack {
+                        Image(systemName: "person.2")
+                            .foregroundColor(.blue)
+                        Text("\(recipe.servings) servings")
+                    }
+                }
+                .font(.subheadline)
+                
+                Divider()
+                
+                // Ingredients
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("INGREDIENTS")
+                        .font(.headline)
+                        .foregroundColor(.blue)
+                    
+                    ForEach(Array(recipe.ingredients.prefix(6).enumerated()), id: \.offset) { index, ingredient in
+                        HStack {
+                            Image(systemName: "circle.fill")
+                                .font(.system(size: 6))
+                                .foregroundColor(.blue)
+                            Text(ingredient)
+                                .font(.caption)
+                        }
+                    }
+                    
+                    if recipe.ingredients.count > 6 {
+                        Text("+ \(recipe.ingredients.count - 6) more...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                
+                Divider()
+                
+                // Instructions preview
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("INSTRUCTIONS")
+                        .font(.headline)
+                        .foregroundColor(.blue)
+                    
+                    Text(recipe.instructions)
+                        .font(.caption)
+                        .lineLimit(4)
+                        .foregroundColor(.secondary)
+                }
+                
+                Spacer()
+                
+                // Footer
+                HStack {
+                    Image(systemName: "heart.fill")
+                        .foregroundColor(.red)
+                        .font(.caption)
+                    Text("My Recipe App")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    Spacer()
+                    Text(Date(), style: .date)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.top)
+            }
+            .padding(24)
+        }
+        .background(Color.white)
+        .frame(width: 400, height: 500)
+        .cornerRadius(20)
+        .shadow(radius: 10)
+    }
+}
+
+// Extension to convert View to UIImage
+extension View {
+    func snapshot() -> UIImage {
+        let controller = UIHostingController(rootView: self.edgesIgnoringSafeArea(.all))
+        let view = controller.view
+        
+        let targetSize = CGSize(width: 400, height: 500)
+        view?.bounds = CGRect(origin: .zero, size: targetSize)
+        view?.backgroundColor = .clear
+        
+        let renderer = UIGraphicsImageRenderer(size: targetSize)
+        return renderer.image { context in
+            view?.layer.render(in: context.cgContext)
+        }
+    }
+}
+
+// MARK: - Share Sheet
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    var onDismiss: (() -> Void)?
+    
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, _, _, _ in
+            onDismiss?()
+        }
+        
+        controller.excludedActivityTypes = [
+            .assignToContact,
+            .saveToCameraRoll,
+            .addToReadingList,
+            .postToFlickr,
+            .postToVimeo,
+            .openInIBooks
+        ]
+        
+        return controller
+    }
+    
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - Preview
