@@ -39,6 +39,11 @@ struct Recipe: Identifiable, Codable {
         self.imageFileName = nil
     }
     
+    // Helper to parse ingredients for grocery list
+    var parsedIngredients: [Ingredient] {
+        ingredients.map { Ingredient(from: $0) }
+    }
+    
     // Generate a safe filename from the recipe name
     var fileName: String {
         let safeName = name
@@ -73,6 +78,653 @@ enum RecipeCategory: String, CaseIterable, Codable {
         case .dessert: return "birthday.cake.fill"
         case .snack: return "carrot.fill"
         case .beverage: return "cup.and.saucer.fill"
+        }
+    }
+}
+
+// MARK: - Grocery List Data Models
+// Add these new models after the existing Recipe model
+
+struct Ingredient: Codable, Identifiable, Equatable {
+    let id = UUID()
+    var name: String
+    var quantity: Double
+    var unit: String
+    var category: GroceryCategory
+    
+    // Parse ingredient string like "2 cups flour" into components
+    init(from string: String) {
+        let components = string.split(separator: " ", maxSplits: 2)
+        
+        if components.count >= 3 {
+            // Try to parse quantity
+            if let qty = Double(components[0]) {
+                self.quantity = qty
+                self.unit = String(components[1])
+                self.name = String(components[2])
+            } else if components.count >= 2, let qty = Double(String(components[0]) + String(components[1])) {
+                // Handle fractions like "1 1/2"
+                self.quantity = qty
+                self.unit = components.count > 2 ? String(components[2]) : ""
+                self.name = components.count > 3 ? components[3...].joined(separator: " ") : ""
+            } else {
+                // No quantity found
+                self.quantity = 1
+                self.unit = ""
+                self.name = string
+            }
+        } else if components.count == 2 {
+            if let qty = Double(components[0]) {
+                self.quantity = qty
+                self.unit = ""
+                self.name = String(components[1])
+            } else {
+                self.quantity = 1
+                self.unit = ""
+                self.name = string
+            }
+        } else {
+            self.quantity = 1
+            self.unit = ""
+            self.name = string
+        }
+        
+        // Auto-categorize based on common ingredients
+        self.category = GroceryCategory.autoCategory(for: self.name)
+    }
+    
+    init(name: String, quantity: Double, unit: String, category: GroceryCategory) {
+        self.name = name
+        self.quantity = quantity
+        self.unit = unit
+        self.category = category
+    }
+}
+
+enum GroceryCategory: String, CaseIterable, Codable {
+    case produce = "Produce"
+    case dairy = "Dairy"
+    case meat = "Meat & Seafood"
+    case pantry = "Pantry"
+    case bakery = "Bakery"
+    case frozen = "Frozen"
+    case beverages = "Beverages"
+    case other = "Other"
+    
+    var icon: String {
+        switch self {
+        case .produce: return "leaf"
+        case .dairy: return "drop"
+        case .meat: return "fish"
+        case .pantry: return "cabinet"
+        case .bakery: return "text.badge.star"
+        case .frozen: return "snowflake"
+        case .beverages: return "cup.and.saucer"
+        case .other: return "cart"
+        }
+    }
+    
+    static func autoCategory(for ingredient: String) -> GroceryCategory {
+        let lowercased = ingredient.lowercased()
+        
+        // Produce keywords
+        let produceKeywords = ["lettuce", "tomato", "onion", "garlic", "carrot", "celery", "potato", "apple", "banana", "orange", "lemon", "lime", "pepper", "cucumber", "spinach", "kale", "broccoli", "cauliflower"]
+        
+        // Dairy keywords
+        let dairyKeywords = ["milk", "cream", "cheese", "yogurt", "butter", "sour cream", "cottage cheese", "mozzarella", "cheddar", "parmesan"]
+        
+        // Meat keywords
+        let meatKeywords = ["chicken", "beef", "pork", "fish", "salmon", "shrimp", "bacon", "sausage", "ground", "steak", "turkey", "ham"]
+        
+        // Pantry keywords
+        let pantryKeywords = ["flour", "sugar", "salt", "pepper", "oil", "vinegar", "rice", "pasta", "beans", "sauce", "spice", "seasoning", "baking powder", "baking soda"]
+        
+        // Bakery keywords
+        let bakeryKeywords = ["bread", "rolls", "bagel", "muffin", "croissant", "tortilla", "pita"]
+        
+        // Check each category
+        if produceKeywords.contains(where: { lowercased.contains($0) }) {
+            return .produce
+        } else if dairyKeywords.contains(where: { lowercased.contains($0) }) {
+            return .dairy
+        } else if meatKeywords.contains(where: { lowercased.contains($0) }) {
+            return .meat
+        } else if pantryKeywords.contains(where: { lowercased.contains($0) }) {
+            return .pantry
+        } else if bakeryKeywords.contains(where: { lowercased.contains($0) }) {
+            return .bakery
+        }
+        
+        return .other
+    }
+}
+
+struct GroceryItem: Identifiable {
+    let id = UUID()
+    var ingredient: Ingredient
+    var isChecked: Bool = false
+    var alreadyHave: Bool = false
+    var fromRecipes: [String] = [] // Track which recipes this came from
+    
+    var displayText: String {
+        if ingredient.quantity > 0 && !ingredient.unit.isEmpty {
+            return "\(formatQuantity(ingredient.quantity)) \(ingredient.unit) \(ingredient.name)"
+        } else if ingredient.quantity > 0 {
+            return "\(formatQuantity(ingredient.quantity)) \(ingredient.name)"
+        } else {
+            return ingredient.name
+        }
+    }
+    
+    private func formatQuantity(_ quantity: Double) -> String {
+        if quantity.truncatingRemainder(dividingBy: 1) == 0 {
+            return String(Int(quantity))
+        } else {
+            return String(format: "%.1f", quantity)
+        }
+    }
+}
+
+enum GrocerySortOption: String, CaseIterable {
+    case category = "By Category"
+    case alphabetical = "Alphabetical"
+    case recipe = "By Recipe"
+    
+    var icon: String {
+        switch self {
+        case .category: return "square.grid.2x2"
+        case .alphabetical: return "textformat.abc"
+        case .recipe: return "book"
+        }
+    }
+}
+
+// MARK: - Grocery List View
+struct GroceryListView: View {
+    let selectedRecipes: [Recipe]
+    @State private var groceryItems: [GroceryItem] = []
+    @State private var sortOption: GrocerySortOption = .category
+    @State private var showingAddItem = false
+    @State private var showingShareSheet = false
+    @State private var shareItems: [Any] = []
+    @State private var editMode: EditMode = .inactive
+    @Environment(\.dismiss) var dismiss
+    
+    var sortedItems: [GroceryItem] {
+        switch sortOption {
+        case .category:
+            return groceryItems.sorted { item1, item2 in
+                if item1.ingredient.category.rawValue != item2.ingredient.category.rawValue {
+                    return item1.ingredient.category.rawValue < item2.ingredient.category.rawValue
+                }
+                return item1.ingredient.name < item2.ingredient.name
+            }
+        case .alphabetical:
+            return groceryItems.sorted { $0.ingredient.name < $1.ingredient.name }
+        case .recipe:
+            return groceryItems.sorted { item1, item2 in
+                let recipe1 = item1.fromRecipes.first ?? ""
+                let recipe2 = item2.fromRecipes.first ?? ""
+                if recipe1 != recipe2 {
+                    return recipe1 < recipe2
+                }
+                return item1.ingredient.name < item2.ingredient.name
+            }
+        }
+    }
+    
+    var itemsByCategory: [(GroceryCategory, [GroceryItem])] {
+        Dictionary(grouping: sortedItems) { $0.ingredient.category }
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .map { ($0.key, $0.value) }
+    }
+    
+    var body: some View {
+        NavigationView {
+            VStack {
+                // Summary header
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text("\(groceryItems.filter { !$0.alreadyHave }.count) items to buy")
+                            .font(.headline)
+                        Text("From \(selectedRecipes.count) recipes")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    // Sort picker
+                    Menu {
+                        ForEach(GrocerySortOption.allCases, id: \.self) { option in
+                            Button(action: { sortOption = option }) {
+                                Label(option.rawValue, systemImage: option.icon)
+                            }
+                        }
+                    } label: {
+                        Label(sortOption.rawValue, systemImage: "arrow.up.arrow.down")
+                            .font(.subheadline)
+                            .foregroundColor(.blue)
+                    }
+                }
+                .padding()
+                .background(Color(.systemGray6))
+                
+                List {
+                    if sortOption == .category {
+                        ForEach(itemsByCategory, id: \.0) { category, items in
+                            Section(header: HStack {
+                                Image(systemName: category.icon)
+                                    .foregroundColor(.blue)
+                                Text(category.rawValue)
+                                    .fontWeight(.semibold)
+                            }) {
+                                ForEach(items) { item in
+                                    GroceryItemRow(item: binding(for: item))
+                                }
+                                .onDelete { indexSet in
+                                    deleteItems(from: items, at: indexSet)
+                                }
+                            }
+                        }
+                    } else {
+                        ForEach(sortedItems) { item in
+                            GroceryItemRow(item: binding(for: item))
+                        }
+                        .onDelete(perform: deleteItems)
+                    }
+                }
+                .listStyle(InsetGroupedListStyle())
+                .environment(\.editMode, $editMode)
+            }
+            .navigationTitle("Shopping List")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+                
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    HStack {
+                        EditButton()
+                        
+                        Menu {
+                            Button(action: { showingAddItem = true }) {
+                                Label("Add Item", systemImage: "plus")
+                            }
+                            
+                            Divider()
+                            
+                            Button(action: shareAsText) {
+                                Label("Share as Text", systemImage: "doc.text")
+                            }
+                            
+                            Button(action: copyToClipboard) {
+                                Label("Copy to Clipboard", systemImage: "doc.on.doc")
+                            }
+                            
+                            Button(action: printList) {
+                                Label("Print", systemImage: "printer")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                    }
+                }
+            }
+            .onAppear {
+                generateGroceryList()
+            }
+            .sheet(isPresented: $showingAddItem) {
+                AddGroceryItemView { newItem in
+                    groceryItems.append(GroceryItem(ingredient: newItem))
+                }
+            }
+            .sheet(isPresented: $showingShareSheet) {
+                ShareSheet(items: shareItems)
+            }
+        }
+    }
+    
+    // MARK: - Helper Functions
+    
+    private func binding(for item: GroceryItem) -> Binding<GroceryItem> {
+        guard let index = groceryItems.firstIndex(where: { $0.id == item.id }) else {
+            return .constant(item)
+        }
+        return $groceryItems[index]
+    }
+    
+    private func deleteItems(at offsets: IndexSet) {
+        groceryItems.remove(atOffsets: offsets)
+    }
+    
+    private func deleteItems(from items: [GroceryItem], at offsets: IndexSet) {
+        for index in offsets {
+            if let itemIndex = groceryItems.firstIndex(where: { $0.id == items[index].id }) {
+                groceryItems.remove(at: itemIndex)
+            }
+        }
+    }
+    
+    private func generateGroceryList() {
+        var ingredientMap: [String: GroceryItem] = [:]
+        
+        for recipe in selectedRecipes {
+            for ingredientString in recipe.ingredients {
+                let ingredient = Ingredient(from: ingredientString)
+                let key = "\(ingredient.name.lowercased())-\(ingredient.unit.lowercased())"
+                
+                if var existingItem = ingredientMap[key] {
+                    // Combine quantities
+                    existingItem.ingredient.quantity += ingredient.quantity
+                    existingItem.fromRecipes.append(recipe.name)
+                    ingredientMap[key] = existingItem
+                } else {
+                    // New item
+                    let groceryItem = GroceryItem(
+                        ingredient: ingredient,
+                        fromRecipes: [recipe.name]
+                    )
+                    ingredientMap[key] = groceryItem
+                }
+            }
+        }
+        
+        groceryItems = Array(ingredientMap.values)
+    }
+    
+    private func shareAsText() {
+        var text = "Shopping List\n"
+        text += String(repeating: "=", count: 13) + "\n\n"
+        
+        if sortOption == .category {
+            for (category, items) in itemsByCategory {
+                text += "\(category.rawValue)\n"
+                text += String(repeating: "-", count: category.rawValue.count) + "\n"
+                for item in items where !item.alreadyHave {
+                    text += "□ \(item.displayText)\n"
+                }
+                text += "\n"
+            }
+        } else {
+            for item in sortedItems where !item.alreadyHave {
+                text += "□ \(item.displayText)\n"
+            }
+        }
+        
+        text += "\n───────────────────────\n"
+        text += "Generated from \(selectedRecipes.count) recipes"
+        
+        shareItems = [text]
+        showingShareSheet = true
+    }
+    
+    private func copyToClipboard() {
+        var text = ""
+        for item in sortedItems where !item.alreadyHave {
+            text += "• \(item.displayText)\n"
+        }
+        UIPasteboard.general.string = text
+        
+        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+        impactFeedback.impactOccurred()
+    }
+    
+    private func printList() {
+        let printInfo = UIPrintInfo(dictionary: nil)
+        printInfo.outputType = .general
+        printInfo.jobName = "Shopping List"
+        
+        let printController = UIPrintInteractionController.shared
+        printController.printInfo = printInfo
+        
+        var html = """
+        <html>
+        <head>
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 20px; }
+                h1 { color: #333; }
+                h2 { color: #666; font-size: 18px; margin-top: 20px; }
+                ul { list-style-type: none; padding-left: 0; }
+                li { margin: 8px 0; padding-left: 25px; position: relative; }
+                li:before { content: "☐"; position: absolute; left: 0; font-size: 18px; }
+                .header { color: #888; font-size: 14px; margin-bottom: 20px; }
+            </style>
+        </head>
+        <body>
+            <h1>Shopping List</h1>
+            <p class="header">Generated from \(selectedRecipes.count) recipes</p>
+        """
+        
+        if sortOption == .category {
+            for (category, items) in itemsByCategory {
+                html += "<h2>\(category.rawValue)</h2><ul>"
+                for item in items where !item.alreadyHave {
+                    html += "<li>\(item.displayText)</li>"
+                }
+                html += "</ul>"
+            }
+        } else {
+            html += "<ul>"
+            for item in sortedItems where !item.alreadyHave {
+                html += "<li>\(item.displayText)</li>"
+            }
+            html += "</ul>"
+        }
+        
+        html += "</body></html>"
+        
+        let formatter = UIMarkupTextPrintFormatter(markupText: html)
+        printController.printFormatter = formatter
+        printController.present(animated: true)
+    }
+}
+
+// MARK: - Grocery Item Row
+struct GroceryItemRow: View {
+    @Binding var item: GroceryItem
+    @State private var isEditing = false
+    
+    var body: some View {
+        HStack {
+            // Check/uncheck button
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    item.isChecked.toggle()
+                }
+                let impactFeedback = UIImpactFeedbackGenerator(style: .light)
+                impactFeedback.impactOccurred()
+            }) {
+                Image(systemName: item.isChecked ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(item.isChecked ? .green : .gray)
+                    .font(.title2)
+            }
+            .buttonStyle(PlainButtonStyle())
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.displayText)
+                    .strikethrough(item.isChecked || item.alreadyHave)
+                    .foregroundColor(item.alreadyHave ? .gray : .primary)
+                
+                if !item.fromRecipes.isEmpty {
+                    Text("For: \(item.fromRecipes.joined(separator: ", "))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            
+            Spacer()
+            
+            // Already have toggle
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    item.alreadyHave.toggle()
+                }
+            }) {
+                Text(item.alreadyHave ? "Have" : "Need")
+                    .font(.caption)
+                    .fontWeight(.medium)
+                    .foregroundColor(item.alreadyHave ? .green : .orange)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(item.alreadyHave ? Color.green.opacity(0.2) : Color.orange.opacity(0.2))
+                    .cornerRadius(15)
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+        .padding(.vertical, 4)
+        .contextMenu {
+            Button(action: { isEditing = true }) {
+                Label("Edit Quantity", systemImage: "pencil")
+            }
+            
+            Button(action: {
+                item.alreadyHave.toggle()
+            }) {
+                Label(item.alreadyHave ? "Mark as Needed" : "Mark as Have",
+                      systemImage: item.alreadyHave ? "cart.badge.plus" : "house")
+            }
+        }
+        .sheet(isPresented: $isEditing) {
+            EditGroceryItemView(item: $item)
+        }
+    }
+}
+
+// MARK: - Add Grocery Item View
+struct AddGroceryItemView: View {
+    let onAdd: (Ingredient) -> Void
+    @Environment(\.dismiss) var dismiss
+    
+    @State private var name = ""
+    @State private var quantity = "1"
+    @State private var unit = ""
+    @State private var category = GroceryCategory.other
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Item Details") {
+                    TextField("Item name", text: $name)
+                    
+                    HStack {
+                        TextField("Quantity", text: $quantity)
+                            .keyboardType(.decimalPad)
+                            .frame(width: 80)
+                        
+                        TextField("Unit (optional)", text: $unit)
+                            .placeholder(when: unit.isEmpty) {
+                                Text("cups, lbs, etc.")
+                                    .foregroundColor(.gray)
+                            }
+                    }
+                    
+                    Picker("Category", selection: $category) {
+                        ForEach(GroceryCategory.allCases, id: \.self) { cat in
+                            Label(cat.rawValue, systemImage: cat.icon)
+                                .tag(cat)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Add Item")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Add") {
+                        let qty = Double(quantity) ?? 1
+                        let ingredient = Ingredient(
+                            name: name,
+                            quantity: qty,
+                            unit: unit,
+                            category: category
+                        )
+                        onAdd(ingredient)
+                        dismiss()
+                    }
+                    .disabled(name.isEmpty)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Edit Grocery Item View
+struct EditGroceryItemView: View {
+    @Binding var item: GroceryItem
+    @Environment(\.dismiss) var dismiss
+    
+    @State private var quantity: String
+    @State private var unit: String
+    
+    init(item: Binding<GroceryItem>) {
+        self._item = item
+        self._quantity = State(initialValue: String(format: "%.1f", item.wrappedValue.ingredient.quantity))
+        self._unit = State(initialValue: item.wrappedValue.ingredient.unit)
+    }
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Edit Quantity") {
+                    HStack {
+                        Text(item.ingredient.name)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    
+                    HStack {
+                        TextField("Quantity", text: $quantity)
+                            .keyboardType(.decimalPad)
+                            .frame(width: 80)
+                        
+                        TextField("Unit", text: $unit)
+                    }
+                }
+            }
+            .navigationTitle("Edit Item")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Save") {
+                        if let qty = Double(quantity) {
+                            item.ingredient.quantity = qty
+                            item.ingredient.unit = unit
+                        }
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - View Extension for Placeholder
+extension View {
+    func placeholder<Content: View>(
+        when shouldShow: Bool,
+        alignment: Alignment = .leading,
+        @ViewBuilder placeholder: () -> Content) -> some View {
+        
+        ZStack(alignment: alignment) {
+            placeholder().opacity(shouldShow ? 1 : 0)
+            self
         }
     }
 }
@@ -1435,13 +2087,16 @@ struct EditRecipeView: View {
     }
 }
 
-// MARK: - Weekly Planning View
+// MARK: - Update WeeklyPlanningView
+// Replace the existing WeeklyPlanningView with this updated version:
+
 struct WeeklyPlanningView: View {
     let selectedRecipeIDs: Set<UUID>
     let recipes: [Recipe]
     let onComplete: () -> Void
     
     @Environment(\.dismiss) var dismiss
+    @State private var showingGroceryList = false
     
     var selectedRecipes: [Recipe] {
         recipes.filter { selectedRecipeIDs.contains($0.id) }
@@ -1474,7 +2129,7 @@ struct WeeklyPlanningView: View {
                             VStack(alignment: .leading) {
                                 Text(recipe.name)
                                     .font(.headline)
-                                Text("\(recipe.servings) servings")
+                                Text("\(recipe.servings) servings • \(recipe.ingredients.count) ingredients")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -1491,9 +2146,7 @@ struct WeeklyPlanningView: View {
                 // Action buttons
                 VStack(spacing: 12) {
                     Button(action: {
-                        // TODO: Generate shopping list
-                        dismiss()
-                        onComplete()
+                        showingGroceryList = true
                     }) {
                         Label("Generate Shopping List", systemImage: "cart.fill")
                             .font(.headline)
@@ -1523,10 +2176,16 @@ struct WeeklyPlanningView: View {
                     }
                 }
             }
+            .fullScreenCover(isPresented: $showingGroceryList) {
+                GroceryListView(selectedRecipes: selectedRecipes)
+                    .onDisappear {
+                        dismiss()
+                        onComplete()
+                    }
+            }
         }
     }
 }
-
 // MARK: - Recipe Card View for Image Export
 struct RecipeCardView: View {
     let recipe: Recipe
